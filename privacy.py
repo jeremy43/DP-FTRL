@@ -202,10 +202,10 @@ def main(_):
     # noise=46.3, using the tree completion trick.
     n = 50000
     delta = 1e-5
-    batch = 500
-    epochs = 100
-    restart_every = 20
-    noise = 46.3
+    batch = 250
+    epochs = 5
+    restart_every = 5
+    noise = 4.
     tree_completion = True
 
     num_batches = n // batch

@@ -20,7 +20,8 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow_datasets as tfds
 from utils import EasyDict
 
-DATA_DIR = os.path.join(os.environ['ML_DATA'], 'TFDS')
+path_ML_DATA = '/Users/zhuyuqing/github_proj/DP-FTRL/data'
+DATA_DIR = os.path.join(path_ML_DATA, 'TFDS')
 
 
 def get_data(data_name: str):

@@ -1,16 +1,3 @@
-# Copyright 2021 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """The tree aggregation protocol for noise addition in DP-FTRL."""
 
@@ -18,6 +5,64 @@ import torch
 from collections import namedtuple
 
 from absl import app
+
+
+
+class TableTorch:
+    @torch.no_grad()
+    def __init__(self, n, shapes, device, n_batch, test_mode=False):
+        """
+        This table records the latest gradient of n data
+        :param n: number of data point
+        :param shapes: shapes of the gradient, which is basically shape of the gradients
+        :param device: device for pytorch tensor
+        :param test_mode: if in test mode, noise will be 1 in each node of the tree
+        """
+        assert n > 0
+        self.n = n
+        self.shapes = shapes
+        self.device = device
+        self.n_batch = n_batch
+        # step is the pointer to the next gradient need to change.
+        self.step = 0
+        # shall we detach it? record n*d
+        self.recorded = []
+        #self.recorded = [[torch.zeros(shape).to(self.device) for shape in shapes]]
+        self.test_mode = test_mode
+
+    @torch.no_grad()
+    def __call__(self, new_param, init=False):
+        """
+        :return: the i-th gradient in the last iteration and update it.
+        """
+
+        idx = self.step % self.n_batch
+        if idx == 0:
+            print('now idx is 0')
+        if init is True:
+            # Add new gradient into the list
+            self.recorded.append([torch.zeros(shape).to(self.device) for shape in self.shapes])
+            for new_p, old_g in zip(new_param, self.recorded[idx]):
+                if new_p.grad is None:
+                    continue
+                old_g.copy_(new_p.grad/self.n_batch)
+            self.step += 1
+            return self.recorded[idx]
+        else:
+            # return the old copy
+            ret_copy = [torch.zeros(shape).to(self.device) for shape in self.shapes]
+            for new_p, old_g, ret_g in zip(new_param, self.recorded[idx], ret_copy):
+                if new_p.grad is None:
+                    continue
+                new_g = new_p.grad *1.0/self.n_batch
+                diff = (new_g - old_g)
+                ret_g.copy_(diff)
+                old_g.copy_(new_g)
+
+            self.step += 1
+            return ret_copy
+
+
 
 
 class CummuNoiseTorch:
