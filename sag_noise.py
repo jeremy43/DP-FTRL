@@ -45,7 +45,7 @@ class TableTorch:
             for new_p, old_g in zip(new_param, self.recorded[idx]):
                 if new_p.grad is None:
                     continue
-                old_g.copy_(new_p.grad/self.n_batch)
+                old_g.copy_(new_p.grad/self.n_batch) # new_p.grad already divdes n_batch
             self.step += 1
             return self.recorded[idx]
         else:
