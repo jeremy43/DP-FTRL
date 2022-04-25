@@ -7,7 +7,6 @@ from collections import namedtuple
 from absl import app
 
 
-
 class TableTorch:
     @torch.no_grad()
     def __init__(self, n, shapes, device, n_batch, test_mode=False):
@@ -31,10 +30,79 @@ class TableTorch:
         self.test_mode = test_mode
 
     @torch.no_grad()
-    def __call__(self, new_param, init=False):
+    def __call__(self, new_param, clip_gradient=None, init=False, ret_old = True):
         """
         :return: the i-th gradient in the last iteration and update it.
         """
+
+        idx = self.step % self.n_batch
+        if idx == 0:
+            print('now idx is 0')
+        if init is True:
+            # Add new gradient into the list
+            self.recorded.append([torch.zeros(shape).to(self.device) for shape in self.shapes])
+            for p, old_g, new_p in zip(new_param, self.recorded[idx], clip_gradient):
+                if p.grad is None:
+                    continue
+
+                old_g.copy_(new_p) # new_p.grad already divdes n_batch
+            self.step += 1
+            return self.recorded[idx]
+        else:
+            if ret_old is True:
+                ret_copy = [old_g.clone() for old_g in self.recorded[idx]]
+                # return the old copy
+                """
+                ret_copy = [torch.zeros(shape).to(self.device) for shape in self.shapes]
+                for new_p, old_g, ret_g in zip(new_param, self.recorded[idx], ret_copy):
+                    if new_p.grad is None:
+                        continue
+                    new_g = new_p.grad *1.0/self.n_batch
+                    diff = (new_g - old_g)
+                    ret_g.copy_()
+                    old_g.copy_(new_g)
+                """
+                return ret_copy
+            else:
+                # Receive a new copy of gradient
+                for new_p, old_g, ret_g in zip(new_param, self.recorded[idx], clip_gradient):
+                    if new_p.grad is None:
+                        continue
+                    old_g.copy_(ret_g)
+
+
+                self.step += 1
+            #return ret_copy
+
+"""
+
+class TableTorch:
+    @torch.no_grad()
+    def __init__(self, n, shapes, device, n_batch, test_mode=False):
+       
+        This table records the latest gradient of n data
+        :param n: number of data point
+        :param shapes: shapes of the gradient, which is basically shape of the gradients
+        :param device: device for pytorch tensor
+        :param test_mode: if in test mode, noise will be 1 in each node of the tree
+      
+        assert n > 0
+        self.n = n
+        self.shapes = shapes
+        self.device = device
+        self.n_batch = n_batch
+        # step is the pointer to the next gradient need to change.
+        self.step = 0
+        # shall we detach it? record n*d
+        self.recorded = []
+        #self.recorded = [[torch.zeros(shape).to(self.device) for shape in shapes]]
+        self.test_mode = test_mode
+
+    @torch.no_grad()
+    def __call__(self, new_param, init=False):
+        
+        :return: the i-th gradient in the last iteration and update it.
+   
 
         idx = self.step % self.n_batch
         if idx == 0:
@@ -61,7 +129,7 @@ class TableTorch:
 
             self.step += 1
             return ret_copy
-
+"""
 
 
 

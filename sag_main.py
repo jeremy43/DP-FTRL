@@ -17,7 +17,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from opacus import PrivacyEngine
 
-from optimizers import FTRLOptimizer, SAGOptimizer, InitOptimizer
+from optimizer import FTRLOptimizer, SAGOptimizer, InitOptimizer
 from sag_noise import CummuNoiseTorch, CummuNoiseEffTorch, TableTorch
 from nn import get_nn
 from data import get_data
@@ -30,19 +30,19 @@ FLAGS = flags.FLAGS
 flags.DEFINE_enum('data', 'mnist', ['mnist', 'cifar10', 'emnist_merge'], '')
 
 flags.DEFINE_boolean('dp_sag', True, 'If True, train with DP-sag. If False, train with vanilla SAG.')
-flags.DEFINE_float('noise_multiplier', 4.0, 'Ratio of the standard deviation to the clipping norm.')
-flags.DEFINE_float('l2_norm_clip', 1.0, 'Clipping norm.')
+flags.DEFINE_float('noise_multiplier', 1., 'Ratio of the standard deviation to the clipping norm.')
+flags.DEFINE_float('l2_norm_clip', 0.1, 'Clipping norm.')
 
 flags.DEFINE_integer('restart', 0, 'If > 0, restart the tree every this number of epoch(s).')
 flags.DEFINE_boolean('effi_noise', False, 'If True, use tree aggregation proposed in https://privacytools.seas.harvard.edu/files/privacytools/files/honaker.pdf.')
 flags.DEFINE_boolean('tree_completion', False, 'If true, generate until reaching a power of 2.')
 
 flags.DEFINE_float('momentum', 0, 'Momentum for DP-FTRL.')
-flags.DEFINE_float('learning_rate', 20, 'Learning rate.')
-flags.DEFINE_integer('batch_size', 25, 'Batch size.')
+flags.DEFINE_float('learning_rate', 0.2, 'Learning rate.')
+flags.DEFINE_integer('batch_size', 250, 'Batch size.')
 flags.DEFINE_integer('epochs', 10, 'Number of epochs.')
-
-flags.DEFINE_integer('report_nimg', -1, 'Write to tb every this number of samples. If -1, write every epoch.')
+flags.DEFINE_boolean('warmup', True, 'If True, use one path DPSGD before runing DP-SAG')
+flags.DEFINE_integer('report_nimg', 30000, 'Write to tb every this number of samples. If -1, write every epoch.')
 
 flags.DEFINE_integer('run', 20, '(run-1) will be used for random seed.')
 flags.DEFINE_string('dir', '.', 'Directory to write the results.')
@@ -76,7 +76,8 @@ def main(argv):
     assert report_nimg % batch == 0
 
     # Get the name of the output directory.
-    log_dir = os.path.join(FLAGS.dir, FLAGS.data,
+    name = 'warmup_'+str(FLAGS.warmup)
+    log_dir = os.path.join(FLAGS.dir, FLAGS.data, name,
                            utils.get_fn(EasyDict(batch=batch),
                                         EasyDict(dpsgd=FLAGS.dp_sag, restart=FLAGS.restart, completion=FLAGS.tree_completion, noise=noise_multiplier, clip=clip, mb=1),
                                         [EasyDict({'lr': lr}),
@@ -116,6 +117,18 @@ def main(argv):
         # Initialization: a full pass of gradient over all data points.
         model.train()
         print('nb_batch', len(loop))
+        if FLAGS.warmup:
+            for it in loop:
+                data, target = data_stream()
+                data = torch.Tensor(data).to(device)
+                target = torch.LongTensor(target).to(device)
+                # compute gradient
+                optimizer.zero_grad()
+                output = model(data).to(device)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step((lr, True, None))
+
         #mean_grad = [torch.zeros(shape).to(device) for shape in shapes]
         for it in loop:
             step += 1
@@ -124,13 +137,21 @@ def main(argv):
             target = torch.LongTensor(target).to(device)
             # compute gradient
             optimizer.zero_grad()
-            output = model(data)
+            output = model(data).to(device)
             loss = criterion(output, target)
-            # Shall we backward?
             loss.backward()
-            optimizer.step()
+            # predict
+            pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+            acc = pred.eq(target.view_as(pred)).sum().item()*1.0 /(batch)
+            #print('accuracy at', step, 'is', acc)
+            # if warmup is true, run one round DP-GD (without sampling)
+            #ret_copy tracks the new clipped gradient returned from the optimizer
+            ret_copy = [torch.zeros(shape).detach().to(device) for shape in shapes]
+            optimizer.step((lr, False, ret_copy))
+            losses.append(loss.item())
             # Update table
-            diff_gradient = prev_grad(model.parameters(), init=True)
+            prev_grad(model.parameters(), clip_gradient =ret_copy, init=True)
+
             """
             for param1, param2 in zip(model.parameters(), mean_grad):
                 if param1.grad is None:
@@ -145,7 +166,7 @@ def main(argv):
         print('Step %04d Accuracy %.2f' % (step, 100 * acc_test))
         writer.add_scalar('eval/loss_train', np.mean(losses), epoch + 1)
         print('Epoch %04d Loss %.2f' % (epoch + 1, np.mean(losses)))
-        return optimizer.mean_grad
+        return optimizer.mean_grad, model
 
     # Function to conduct training for one epoch
     def train_loop(model,  device, prev_grad, optimizer, cumm_noise, epoch, writer):
@@ -162,14 +183,14 @@ def main(argv):
             target = torch.LongTensor(target).to(device)
 
             optimizer.zero_grad()
-            output = model(data)
+            output = model(data).to(device)
             loss = criterion(output, target)
             loss.backward()
-            if it <20:
-                print('i=', it)
-            diff_gradient = prev_grad(model.parameters(), init=False)
-
-            optimizer.step((lr, cumm_noise(), diff_gradient))
+            old_gradient = prev_grad(model.parameters(), init=False, ret_old = True)
+            # ret_copy tracks the new clipped gradient
+            ret_copy = [torch.zeros(shape).detach().to(device) for shape in shapes]
+            optimizer.step((lr, cumm_noise(), old_gradient, ret_copy))
+            prev_grad(model.parameters(), clip_gradient = ret_copy, init=False, ret_old = False)
             losses.append(loss.item())
 
             if (step * batch) % report_nimg == 0:
@@ -215,25 +236,31 @@ def main(argv):
     writer = SummaryWriter(os.path.join(log_dir, 'tb'))
     shapes = [p.shape for p in model.parameters()]
     prev_grad = TableTorch(noise_multiplier * clip / batch, shapes, device, num_batches)
-    #mean_grad = train_init(model, device, prev_grad, writer, shapes)
-    #mean_grad = [torch.zeros(shape).to(device) for shape in shapes]
 
-    ini_optimizer = InitOptimizer(model_copy.parameters(), shapes, device, num_batches,noise_multiplier * clip /
-                                  (np.log(num_batches)*batch*num_batches))
+    ini_optimizer = InitOptimizer(model_copy.parameters(), shapes, device, num_batches, noise_multiplier * clip /
+                                  (batch*num_batches))
     privacy_engine = PrivacyEngine(model_copy, batch_size=batch, sample_size=ntrain, alphas=[], noise_multiplier=0,
                                    max_grad_norm=clip)
     privacy_engine.attach(ini_optimizer)
+    """
+    model_parameters = filter(lambda p: p.grad_sample, model.parameters())
+    params = sum([np.prod(p.size()) for p in model_parameters])
+    print('before num of params', params)
+    """
     # without model_copy, there is some issue with opaque.
-    mean_grad = train_init(model_copy, ini_optimizer, device, prev_grad, writer, shapes)
+    mean_grad, init_model = train_init(model_copy, ini_optimizer, device, prev_grad, writer, shapes)
 
+    model.load_state_dict(init_model.state_dict())
+    #model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    #params = sum([np.prod(p.size()) for p in model_parameters])
+    #print(' after num of params', params)
     privacy_engine.detach()
-    mean_grad = [torch.zeros(shape).to(device) for shape in shapes]
 
-
-    optimizer = SAGOptimizer(model.parameters(), mean_grad, momentum=FLAGS.momentum,
+    optimizer = SAGOptimizer(model.parameters(), mean_grad, num_batches, device, shapes, momentum=FLAGS.momentum,
                               record_last_noise=FLAGS.restart > 0 and FLAGS.tree_completion)
     if FLAGS.dp_sag:
-        privacy_engine = PrivacyEngine(model, batch_size=batch, sample_size=ntrain, alphas=[], noise_multiplier=0, max_grad_norm=clip)
+        privacy_engine = PrivacyEngine(model, batch_size=batch, sample_size=ntrain, alphas=[], noise_multiplier=0,
+                                       max_grad_norm=clip)
         privacy_engine.attach(optimizer)
 
 
@@ -242,9 +269,9 @@ def main(argv):
             return lambda: [torch.Tensor([0]).to(device)] * len(shapes)  # just return scalar 0
         if not effi_noise:
             # we divide num_batches as the sum is over 1./(num_batches).
-            cumm_noise = CummuNoiseTorch(noise_multiplier * clip / (batch*num_batches), shapes, device)
+            cumm_noise = CummuNoiseTorch(np.log(num_batches)*np.sqrt(2)*noise_multiplier * clip / (batch*num_batches), shapes, device)
         else:
-            cumm_noise = CummuNoiseEffTorch(noise_multiplier * clip / (batch*num_batches), shapes, device)
+            cumm_noise = CummuNoiseEffTorch(np.log(num_batches)*np.sqrt(2)*noise_multiplier * clip / (batch*num_batches), shapes, device)
         return cumm_noise
 
     cumm_noise = get_cumm_noise(FLAGS.effi_noise)

@@ -47,7 +47,8 @@ class FTRLOptimizer(torch.optim.Optimizer):
                     continue
                 d_p = p.grad
                 param_state = self.state[p]
-
+                if d_p.norm(2)>1.:
+                    print( 'norm is not correct', d_p.norm(2))
                 if len(param_state) == 0:
                     param_state['grad_sum'] = torch.zeros_like(d_p, memory_format=torch.preserve_format)
                     param_state['model_sum'] = p.detach().clone(memory_format=torch.preserve_format)  # just record the initial model
@@ -103,10 +104,14 @@ class InitOptimizer(torch.optim.Optimizer):
         self.shapes = shapes
         self.device = device
         self.std = std
-        self.sgd_std = std * n_batch # std for sgd
+        self.idx = 0
+        self.sgd_std = 0.000000001
+        # self.sgd_std = std * n_batch # std for sgd
         #self.mean_grad = [torch.zeros(shape).to(device) for shape in shapes]
         self.mean_grad = [torch.normal(0, self.std, shape).to(device) for shape in shapes]
         self.n_batch = n_batch
+        # record for gradient table
+        self.record = []
         super(InitOptimizer, self).__init__(params, dict())
 
     def __setstate__(self, state):
@@ -121,12 +126,11 @@ class InitOptimizer(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-
+        self.record.append([torch.zeros(shape).to(self.device) for shape in self.shapes])
         for group in self.param_groups:
-            for p, mean_g, shape in zip(group['params'], self.mean_grad, self.shapes):
+            for p, mean_g, shape, store_g in zip(group['params'], self.mean_grad, self.shapes,self.record[self.idx]):
                 if p.grad is None:
                     continue
-                # d_p = p.grad
                 param_state = self.state[p]
                 if len(param_state) == 0:
                     # Add the mean of gradient into the gradient sum
@@ -134,14 +138,20 @@ class InitOptimizer(torch.optim.Optimizer):
                     param_state['model_sum'] = p.detach().clone(memory_format=torch.preserve_format)
                 if warmup:
                     nz = torch.normal(0, self.sgd_std, shape).to(self.device)
-                    p.add((-p.grad - nz) * alpha)
+                    ##p.add((-p.grad/self.n_batch - nz) * alpha)
+                    p.add(-p.grad*2000)
                 gs = param_state['grad_sum']
+                # compute the sum of gradients over all data points.
                 gs.add_(p.grad/(self.n_batch))
+                # initialize gradient table
+                # Add new gradient into the list
+                store_g.copy_(p.grad /self.n_batch)  # new_p.grad already divdes n_batch
 
+        self.idx +=1
         return loss
 
 class SAGOptimizer(torch.optim.Optimizer):
-    def __init__(self, params, mean_grad, momentum: float, record_last_noise: bool = True):
+    def __init__(self, params, mean_grad, record, n_batch, momentum: float, record_last_noise: bool = True):
         """
         :param params: parameter groups
         :param momentum: if non-zero, use DP-FTRLM
@@ -150,6 +160,9 @@ class SAGOptimizer(torch.optim.Optimizer):
         self.momentum = momentum
         self.record_last_noise = record_last_noise
         self.mean_grad = mean_grad
+        self.idx = 0
+        self.record = record
+        self.n_batch = n_batch
         super(SAGOptimizer, self).__init__(params, dict())
 
     def __setstate__(self, state):
@@ -157,19 +170,19 @@ class SAGOptimizer(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, args, closure=None):
-        alpha, noise, diff_gradient = args
+        alpha, noise = args
         loss = None
+        idx = self.idx % self.n_batch
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
         for group in self.param_groups:
-            for p, nz, diff_g, mean_g in zip(group['params'], noise, diff_gradient, self.mean_grad):
+            for p, nz, old_g, mean_g in zip(group['params'], noise, self.record[idx], self.mean_grad):
                 if p.grad is None:
                     continue
                 #d_p = p.grad
                 param_state = self.state[p]
-
                 if len(param_state) == 0:
                     print('yes, initialized with mean')
                     # Add the mean of gradient into the gradient sum
@@ -180,9 +193,16 @@ class SAGOptimizer(torch.optim.Optimizer):
                     if self.record_last_noise:
                         param_state['last_noise'] = torch.zeros_like(p, memory_format=torch.preserve_format)  # record the last noise needed, in order for restarting
                 gs, ms = param_state['grad_sum'], param_state['model_sum']
+
                 if self.momentum == 0:
+                    new_g = p.grad * 1.0 / self.n_batch
+                    diff_g = new_g - old_g
                     gs.add_(diff_g)
                     p.add_((-gs - nz) * alpha)
+                    old_g.copy_(new_g)
+
+                    # if diff_g.norm(2)>1:
+                    #print('wrong gradient norm of diff', diff_g.norm(2))
                     #p.copy_(ms + (-gs - nz) * alpha)
                 else:
                     raise NotImplementedError
@@ -191,6 +211,7 @@ class SAGOptimizer(torch.optim.Optimizer):
                     p.copy_(ms - param_state['momentum'] / alpha)
                 if self.record_last_noise:
                     param_state['last_noise'].copy_(nz)
+        self.idx+=1
         return loss
 
     @torch.no_grad()
