@@ -17,7 +17,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from opacus import PrivacyEngine
 
-from optimizer import FTRLOptimizer, SAGOptimizer, InitOptimizer
+from optimizer import FTRLOptimizer, SAGOptimizer, InitOptimizer, SAGAOptimizer
 from sag_noise import CummuNoiseTorch, CummuNoiseEffTorch, TableTorch
 from nn import get_nn
 from data import get_data
@@ -27,20 +27,20 @@ from utils import EasyDict
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_enum('data', 'mnist', ['mnist', 'cifar10', 'emnist_merge'], '')
+flags.DEFINE_enum('data', 'cifar10', ['mnist', 'cifar10', 'emnist_merge'], '')
 
 flags.DEFINE_boolean('dp_sag', True, 'If True, train with DP-sag. If False, train with vanilla SAG.')
 flags.DEFINE_float('noise_multiplier', 1., 'Ratio of the standard deviation to the clipping norm.')
-flags.DEFINE_float('l2_norm_clip', 0.1, 'Clipping norm.')
+flags.DEFINE_float('l2_norm_clip', 1., 'Clipping norm.')
 
 flags.DEFINE_integer('restart', 0, 'If > 0, restart the tree every this number of epoch(s).')
 flags.DEFINE_boolean('effi_noise', False, 'If True, use tree aggregation proposed in https://privacytools.seas.harvard.edu/files/privacytools/files/honaker.pdf.')
 flags.DEFINE_boolean('tree_completion', False, 'If true, generate until reaching a power of 2.')
 
 flags.DEFINE_float('momentum', 0, 'Momentum for DP-FTRL.')
-flags.DEFINE_float('learning_rate', 0.2, 'Learning rate.')
-flags.DEFINE_integer('batch_size', 250, 'Batch size.')
-flags.DEFINE_integer('epochs', 10, 'Number of epochs.')
+flags.DEFINE_float('learning_rate', 0.3, 'Learning rate.')
+flags.DEFINE_integer('batch_size', 100, 'Batch size.')
+flags.DEFINE_integer('epochs', 100, 'Number of epochs.')
 flags.DEFINE_boolean('warmup', True, 'If True, use one path DPSGD before runing DP-SAG')
 flags.DEFINE_integer('report_nimg', 30000, 'Write to tb every this number of samples. If -1, write every epoch.')
 
@@ -76,7 +76,7 @@ def main(argv):
     assert report_nimg % batch == 0
 
     # Get the name of the output directory.
-    name = 'warmup_'+str(FLAGS.warmup)
+    name = '_no_DPSAG'+str(FLAGS.warmup)
     log_dir = os.path.join(FLAGS.dir, FLAGS.data, name,
                            utils.get_fn(EasyDict(batch=batch),
                                         EasyDict(dpsgd=FLAGS.dp_sag, restart=FLAGS.restart, completion=FLAGS.tree_completion, noise=noise_multiplier, clip=clip, mb=1),
@@ -127,7 +127,7 @@ def main(argv):
                 output = model(data).to(device)
                 loss = criterion(output, target)
                 loss.backward()
-                optimizer.step((lr, True, None))
+                optimizer.step((lr*4, True, None))
 
         #mean_grad = [torch.zeros(shape).to(device) for shape in shapes]
         for it in loop:
@@ -145,12 +145,12 @@ def main(argv):
             acc = pred.eq(target.view_as(pred)).sum().item()*1.0 /(batch)
             #print('accuracy at', step, 'is', acc)
             # if warmup is true, run one round DP-GD (without sampling)
-            #ret_copy tracks the new clipped gradient returned from the optimizer
+            #ret_copy tracks the new clipped gradient returned from the optimizeri
             ret_copy = [torch.zeros(shape).detach().to(device) for shape in shapes]
             optimizer.step((lr, False, ret_copy))
             losses.append(loss.item())
             # Update table
-            prev_grad(model.parameters(), clip_gradient =ret_copy, init=True)
+            prev_grad(model.parameters(), clip_gradient =ret_copy, init=True, ret_old = False )
 
             """
             for param1, param2 in zip(model.parameters(), mean_grad):
@@ -169,7 +169,7 @@ def main(argv):
         return optimizer.mean_grad, model
 
     # Function to conduct training for one epoch
-    def train_loop(model,  device, prev_grad, optimizer, cumm_noise, epoch, writer):
+    def train_loop(model, lr, device, prev_grad, optimizer, cumm_noise, epoch, writer):
         criterion = torch.nn.CrossEntropyLoss(reduction='mean')
         losses = []
         loop = trange(0, num_batches * batch, batch,
@@ -199,7 +199,9 @@ def main(argv):
                 writer.add_scalar('eval/accuracy_train', 100 * acc_train, step)
                 model.train()
                 print('Step %04d Accuracy %.2f' % (step, 100 * acc_test))
-
+        mean_norm = sum(optimizer.norm_list)/(len(optimizer.norm_list))
+        writer.add_scalar('table_norm', mean_norm, epoch+1)
+        print('Mean of table norm', mean_norm, 'epoch', epoch+1)
         writer.add_scalar('eval/loss_train', np.mean(losses), epoch + 1)
         print('Epoch %04d Loss %.2f' % (epoch + 1, np.mean(losses)))
 
@@ -256,7 +258,8 @@ def main(argv):
     #print(' after num of params', params)
     privacy_engine.detach()
 
-    optimizer = SAGOptimizer(model.parameters(), mean_grad, num_batches, device, shapes, momentum=FLAGS.momentum,
+    std = noise_multiplier *np.sqrt(2) * clip / batch
+    optimizer = SAGOptimizer(model.parameters(), mean_grad,  num_batches, device, shapes, momentum=FLAGS.momentum,
                               record_last_noise=FLAGS.restart > 0 and FLAGS.tree_completion)
     if FLAGS.dp_sag:
         privacy_engine = PrivacyEngine(model, batch_size=batch, sample_size=ntrain, alphas=[], noise_multiplier=0,
@@ -276,11 +279,14 @@ def main(argv):
 
     cumm_noise = get_cumm_noise(FLAGS.effi_noise)
 
-
+    lr = FLAGS.learning_rate
     # The training loop.
     for epoch in range(1, epochs):
-        train_loop(model, device, prev_grad, optimizer, cumm_noise, epoch, writer)
-
+        #print('lr is ', lr, 'avg norm in table is', sum(optimizer.norm_list)/(len(optimizer.norm_list)))
+        train_loop(model, lr, device, prev_grad, optimizer, cumm_noise, epoch, writer)
+        if epoch % 8 == 0:
+            lr = max(lr * 0.7, FLAGS.learning_rate)
+            print('lr at ', epoch, 'th epoch is', lr)
         if epoch + 1 == epochs:
             break
         restart_now = epoch < epochs - 1 and FLAGS.restart > 0 and (epoch + 1) % FLAGS.restart == 0

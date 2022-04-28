@@ -121,7 +121,8 @@ class InitOptimizer(torch.optim.Optimizer):
                     # run DP-SGD
                     avg_grad = p.grad
                     nz = torch.normal(0, self.sgd_std, shape).to(self.device)
-                    p.data.add_((-avg_grad - nz) * alpha)
+                    p.data.add_(-avg_grad*alpha)
+                    #p.data.add_((-avg_grad - nz) * alpha)
             return
         else:
             for group in self.param_groups:
@@ -149,10 +150,12 @@ class SAGOptimizer(torch.optim.Optimizer):
         :param momentum: if non-zero, use DP-FTRLM
         :param record_last_noise: whether to record the last noise. for the tree completion trick.
         """
-        self.momentum = momentum
+        self.momentum = 0
         self.record_last_noise = record_last_noise
         self.mean_grad = mean_grad
         #self.mean_grad = [torch.zeros(shape).to(device) for shape in shapes]
+        self.total_step = 0
+        self.norm_list = [0]
         self.device = device
         self.shapes = shapes
         self.n_batches = n_batches
@@ -165,11 +168,13 @@ class SAGOptimizer(torch.optim.Optimizer):
     def step(self, args, closure=None):
         alpha, noise, old_gradient, ret_copy = args
         loss = None
+        self.total_step+=1
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
         #ret_copy = [torch.zeros(shape).to(self.device) for shape in self.shapes]
+        l2_norm = 0
         for group in self.param_groups:
             for p, nz, old_g, mean_g, ret_g in zip(group['params'], noise, old_gradient, self.mean_grad, ret_copy):
                 if p.grad is None:
@@ -189,13 +194,14 @@ class SAGOptimizer(torch.optim.Optimizer):
                 ret_g.copy_(p.grad/self.n_batches)
                 if self.momentum == 0:
 
-                    #SAGA UPDATE
-                    p.add_((-gs - nz -(p.grad - self.n_batches*old_g)) * alpha)
                     gs.add_(p.grad / self.n_batches - old_g)
-                    """
-                    gs.add_(p.grad/self.n_batches - old_g)
-                    p.add_((-gs - nz) * alpha)
-                    """
+                    #gs.add_(p.grad/self.n_batches - old_g)
+                    #gs.add_(p.grad/self.n_batches - old_g)
+                    #p.add_((-gs-nz) * alpha)
+                    #p.add_((-p.grad - n_z) * alpha)
+                    l2_norm += gs.norm(2)
+                    p.add(-gs * alpha)
+                    #p.add_((-gs - nz) * alpha)
                     #p.copy_(ms + (-gs - nz) * alpha)
                 else:
                     raise NotImplementedError
@@ -204,8 +210,9 @@ class SAGOptimizer(torch.optim.Optimizer):
                     p.copy_(ms - param_state['momentum'] / alpha)
                 if self.record_last_noise:
                     param_state['last_noise'].copy_(nz)
-        return ret_copy
-        #return loss
+        self.norm_list.append(l2_norm)
+        #return ret_copy
+        return loss
 
     @torch.no_grad()
     def restart(self, last_noise=None):
@@ -324,3 +331,43 @@ class SAGAOptimizer(torch.optim.Optimizer):
                     if len(param_state) == 0:
                         continue
                     param_state['grad_sum'].add_(nz)
+
+
+
+
+
+
+
+class SGDOptimizer(torch.optim.Optimizer):
+    def __init__(self, params,std,  n_batches, device, shapes):
+        """
+        :param params: parameter groups
+        :param momentum: if non-zero, use DP-FTRLM
+        :param record_last_noise: whether to record the last noise. for the tree completion trick.
+        """
+        self.device = device
+        self.std = std
+        self.shapes = shapes
+        super(SGDOptimizer, self).__init__(params, dict())
+
+    def __setstate__(self, state):
+        super(SGDOptimizer, self).__setstate__(state)
+
+    @torch.no_grad()
+    def step(self, args, closure=None):
+        alpha = args
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        #ret_copy = [torch.zeros(shape).to(self.device) for shape in self.shapes]
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                #d_p = p.grad
+                n_z = torch.normal(0, self.std, p.grad.shape).to(self.device)
+                p.add_((-p.grad - n_z) * alpha)
+        #return ret_copy
+        return loss

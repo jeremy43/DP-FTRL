@@ -36,8 +36,6 @@ class TableTorch:
         """
 
         idx = self.step % self.n_batch
-        if idx == 0:
-            print('now idx is 0')
         if init is True:
             # Add new gradient into the list
             self.recorded.append([torch.zeros(shape).to(self.device) for shape in self.shapes])
